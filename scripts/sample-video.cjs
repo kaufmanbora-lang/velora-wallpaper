@@ -1,0 +1,2 @@
+const {run,ffmpeg}=require('../desktop/media.cjs');
+run(ffmpeg,['-hide_banner','-loglevel','error','-y','-loop','1','-i','assets/lavender.png','-t','8','-vf','scale=4000:2250,crop=3840:2160:x=80+40*sin(t*0.785398163):y=45+20*cos(t*0.785398163),fps=24','-c:v','libx264','-preset','fast','-crf','22','-pix_fmt','yuv420p','-threads','4','-movflags','+faststart','assets/flow.mp4']).then(()=>console.log('4K sample ready')).catch(e=>{console.error(e);process.exit(1);});

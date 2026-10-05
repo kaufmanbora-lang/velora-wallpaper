@@ -1,0 +1,8 @@
+Velora 0.1.0 — preview software.
+Includes Electron/Chromium, React, lucide, sharp, Koffi, Google GenAI SDK and FFmpeg.
+Third-party components retain their respective licenses. FFmpeg binaries from ffmpeg-static
+are GPL-3.0; the complete Velora source is distributed under GPL-3.0-or-later.
+FFmpeg source/build instructions: https://github.com/eugeneware/ffmpeg-static
+FFprobe source/build instructions: https://github.com/joshwnj/ffprobe-static
+No Google API key is included. AI requests use the user's own key and Google billing.
+Velora is not affiliated with Pinterest, Microsoft or Google.

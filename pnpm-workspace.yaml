@@ -1,0 +1,9 @@
+allowBuilds:
+  '@google/genai': false
+  electron-winstaller: false
+  protobufjs: false
+  electron: true
+  esbuild: true
+  ffmpeg-static: true
+  koffi: true
+  sharp: true
