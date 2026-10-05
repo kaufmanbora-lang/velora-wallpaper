@@ -23,6 +23,8 @@ jobs:
           version: 11.19.0
       - run: pnpm install --frozen-lockfile
       - run: pnpm test
+      - name: Simulate 1000 isolated client queues
+        run: node scripts/load-qa.cjs
       - run: pnpm build
       - name: Linux display dependencies
         if: runner.os == 'Linux'
@@ -58,3 +60,41 @@ jobs:
           name: linux-qa
           path: .qa/*.json
           include-hidden-files: true
+  stage-draft:
+    needs: build
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check whether this version has an unpublished draft
+        id: draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="v$(node -p 'require("./package.json").version')"
+          draft=$(gh release view "$tag" --json isDraft --jq '.isDraft' 2>/dev/null || true)
+          echo "exists=$draft" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+      - uses: actions/download-artifact@v4
+        if: steps.draft.outputs.exists == 'true'
+        with:
+          pattern: velora-*-x64
+          path: artifacts
+          merge-multiple: true
+      - name: Stage verified files without publishing the draft
+        if: steps.draft.outputs.exists == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.draft.outputs.tag }}
+        run: |
+          set -euo pipefail
+          version="${RELEASE_TAG#v}"
+          mv "artifacts/Velora-$version-x86_64.AppImage" "artifacts/Velora-$version-x64.AppImage"
+          mv "artifacts/Velora-$version-amd64.deb" "artifacts/Velora-$version-x64.deb"
+          git archive --format=zip --output="artifacts/Velora-source-$version.zip" HEAD
+          (cd artifacts && sha256sum *.exe *.AppImage *.deb *.zip > SHA256SUMS.txt)
+          gh release edit "$RELEASE_TAG" --target "$GITHUB_SHA"
+          gh release upload "$RELEASE_TAG" artifacts/* --clobber

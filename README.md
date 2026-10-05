@@ -38,6 +38,16 @@ pnpm start
 
 `pnpm dev` previews the UI in a browser; OS actions explicitly require the desktop build. `node scripts/qa.cjs` checks desktop import, 4K/Ultra, library state and wallpaper attachment. It temporarily starts and stops a test video wallpaper. An isolated profile is used. `pnpm dist:win` and `pnpm dist:linux` build on the matching host OS. CI builds both targets with the lockfile.
 
+## Concurrent users and load
+
+Velora uses a distributed desktop architecture: each installation processes media locally and sends AI requests directly to Google with its owner's key. There is no central Velora generation server, shared queue, shared API key or shared generation bill. The static download site and GitHub Releases serve distribution; opening buttons or playing wallpaper does not call them. This avoids an application-server bottleneck for 1,000 independent users, but is not a guarantee of Google quota or worldwide network availability.
+
+Each desktop admits up to four processing jobs: one running and three waiting. Identical in-flight requests are coalesced, excess jobs fail immediately with a visible queue-full message, and queued jobs can be canceled before submission. Import and wallpaper changes also have concurrency guards. Closing the application cancels pending jobs; they are intentionally not submitted again automatically after restart. Previously chosen wallpaper still restores independently.
+
+Explicit HTTP 429 responses use bounded exponential backoff, jitter and Retry-After. Status reads can retry temporary server/network failures; potentially billable generation submissions are not automatically repeated after ambiguous network/5xx failures. SDK retries are disabled for submissions to avoid overlapping retry policies. Operation polling is staggered. Retries never create additional quota. Google applies quota **per project, not per API key**: https://ai.google.dev/gemini-api/docs/rate-limits.
+
+`node scripts/load-qa.cjs` simulates 1,000 isolated desktop queues and 24,000 clicks: 4,000 accepted tasks, 20,000 coalesced duplicates, plus 1,000 rejected overflows. It checks the one-worker bound and recovery from 400 mocked 429 errors. The simulation makes no Google calls and performs no real video rendering. It validates scheduling and isolation, not 1,000 live cloud generations or CDN throughput. Real cloud throughput requires authorized paid testing with available Google projects and quotas.
+
 ## Security and privacy
 
 The renderer is sandboxed with context isolation, no Node integration, a restricted preload bridge, IPC sender validation and a restrictive CSP. Media requests resolve library IDs instead of caller-controlled filesystem paths. Pinterest network requests restrict domains and redirects. API keys use Electron safeStorage (Windows DPAPI; OS keyring on Linux). If a secure Linux backend is unavailable, keys live only in memory. The key is never returned to the renderer after saving or included in installers. AI files go directly to Google; local processing stays on the computer. Google may charge even when a locally tracked request is canceled.

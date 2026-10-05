@@ -3,13 +3,92 @@ const sharp=require('sharp');
 const {GoogleGenAI}=require('@google/genai');
 const {setTimeout:delay}=require('node:timers/promises');
 const {dimensions}=require('./core.cjs');
+const {providerRequest}=require('./provider-request.cjs');
 const RATIOS=['1:1','2:3','3:2','3:4','4:3','4:5','5:4','9:16','16:9','21:9'];
 function ratio(w,h){return RATIOS.reduce((best,r)=>{const [a,b]=r.split(':').map(Number),[x,y]=best.split(':').map(Number);return Math.abs(a/b-w/h)<Math.abs(x/y-w/h)?r:best;},'16:9');}
-function client(key,signal){if(!key)throw new Error('Подключите Gemini в настройках.');return new GoogleGenAI({apiKey:key,httpOptions:{timeout:600000,abortSignal:signal}});}
+function client(key){
+  if(!key)throw new Error('Подключите Gemini в настройках.');
+  // Our wrapper distinguishes reads from potentially billable submissions.
+  return new GoogleGenAI({apiKey:key,httpOptions:{timeout:600000,retryOptions:{attempts:1}}});
+}
+function interactionOptions(signal){return {maxRetries:0,timeout:600000,fetchOptions:{signal:AbortSignal.any([...(signal?[signal]:[]),AbortSignal.timeout(600000)])}};}
 function outputPart(result,type){const named=result[`output_${type}`];if(named)return named;return [...(result.steps||[]),...(result.outputs||[])].flatMap(x=>x.content||[]).find(x=>x.type===type&&(x.data||x.uri));}
-async function savePart(part,out,key,signal){if(part?.data){await fs.writeFile(out,Buffer.from(part.data,'base64'));return;}if(!part?.uri)throw new Error('Модель не вернула файл. Возможно, запрос отклонён фильтром или квотой.');let url=new URL(part.uri);for(let i=0;i<6;i++){if(url.protocol!=='https:'||!['generativelanguage.googleapis.com','storage.googleapis.com'].includes(url.hostname)&&!url.hostname.endsWith('.googleusercontent.com'))throw new Error('Неожиданный адрес результата Google.');const headers=url.hostname==='generativelanguage.googleapis.com'?{'x-goog-api-key':key}:{};const r=await fetch(url,{headers,signal,redirect:'manual'});if(r.status>=300&&r.status<400){await r.body?.cancel();url=new URL(r.headers.get('location'),url);continue;}if(!r.ok)throw new Error(`Google: не удалось скачать результат (${r.status}).`);const {pipeline}=require('node:stream/promises');const {Readable}=require('node:stream');const {createWriteStream}=require('node:fs');await pipeline(Readable.fromWeb(r.body),createWriteStream(out),{signal});return;}throw new Error('Слишком много перенаправлений Google.');}
-async function image(key,file,out,options,signal){const {width,height}=dimensions(options.width,options.height);const source=await sharp(file).rotate().resize(2048,2048,{fit:'inside',withoutEnlargement:true}).png().toBuffer();const prompt=options.mode==='ai-enhance'?'Restore and enhance this image naturally. Preserve identity, layout, objects and text. Improve compression artifacts, textures and detail without inventing objects.':`Outpaint this image to a ${ratio(width,height)} desktop wallpaper. Preserve the original composition and every subject. Extend the scene beyond the original borders using matching perspective, lighting, texture and context. Never stretch or crop the subject, never use blurred, mirrored or repeated edge fill. Natural seamless continuation. ${options.prompt||''}`;const ai=client(key,signal);const response=await ai.interactions.create({model:'gemini-3.1-flash-image',input:[{type:'text',text:prompt},{type:'image',mime_type:'image/png',data:source.toString('base64')}],response_format:{type:'image',mime_type:'image/png',aspect_ratio:ratio(width,height),image_size:'4K'},store:false});const part=outputPart(response,'image');if(!part?.data)throw new Error('Gemini не вернул изображение. Проверьте доступ к модели и квоту.');let result=sharp(Buffer.from(part.data,'base64')).resize(width,height,{fit:'cover'});if(options.mode!=='ai-enhance'){const meta=await sharp(source).metadata();const scale=Math.min(width/meta.width,height/meta.height);const pw=Math.round(meta.width*scale),ph=Math.round(meta.height*scale);const original=await sharp(file).rotate().resize(pw,ph).png().toBuffer();result=result.composite([{input:original,left:Math.floor((width-pw)/2),top:Math.floor((height-ph)/2)}]);}await result.png().toFile(out);}
-async function animate(key,file,out,options,job){const ai=client(key,job.signal);const bytes=await sharp(file).rotate().resize(2048,2048,{fit:'inside',withoutEnlargement:true}).png().toBuffer();let op=await ai.models.generateVideos({model:'veo-3.1-generate-preview',image:{imageBytes:bytes.toString('base64'),mimeType:'image/png'},prompt:`Animate this image as a calm living desktop wallpaper. Locked camera, subtle natural movement, preserve composition and identity, no cuts, no text, loop-friendly beginning and ending. ${options.prompt||''}`,config:{aspectRatio:options.width>=options.height?'16:9':'9:16',resolution:'4k',durationSeconds:8,numberOfVideos:1}});job.stage('Veo генерирует 8 секунд в 4K…');const until=Date.now()+20*60*1000;while(!op.done){if(Date.now()>until)throw new Error(`Google ещё обрабатывает видео. Операция: ${op.name}. Повторный запуск создаст новый платный запрос.`);await delay(8000,null,{signal:job.signal});op=await ai.operations.getVideosOperation({operation:op});}if(op.error)throw new Error(op.error.message||'Ошибка генерации Veo');const v=op.response?.generatedVideos?.[0]?.video;await savePart(v?{data:v.videoBytes,uri:v.uri}:null,out,key,job.signal);}
-async function expandVideo(key,file,out,options,job){const ai=client(key,job.signal);let uploaded;try{job.stage('Загрузка ролика в Google…');uploaded=await ai.files.upload({file,config:{mimeType:'video/mp4'}});for(let i=0;uploaded.state==='PROCESSING'&&i<90;i++){await delay(3000,null,{signal:job.signal});uploaded=await ai.files.get({name:uploaded.name});}if(uploaded.state!=='ACTIVE')throw new Error('Google не смог подготовить видео.');job.stage('ИИ дорисовывает движущиеся края…');const res=await ai.interactions.create({model:'gemini-omni-1.1-flash',input:[{type:'video',uri:uploaded.uri},{type:'text',text:`Expand the canvas to ${options.width>=options.height?'16:9':'9:16'}. Outpaint the missing borders with temporally coherent continuation of the original scene. Preserve the complete original video, its subjects, timing, lighting and motion. No cropping, no stretching, no cuts. Keep everything else the same. ${options.prompt||''}`}],response_format:{type:'video',aspect_ratio:options.width>=options.height?'16:9':'9:16',resolution:'1080p',delivery:'uri'},store:false,background:false});await savePart(outputPart(res,'video'),out,key,job.signal);}finally{if(uploaded?.name)await ai.files.delete({name:uploaded.name}).catch(()=>{});}}
-async function testKey(key){const ai=client(key);const names=[];for await(const m of await ai.models.list({config:{pageSize:100}}))names.push(m.name);return {count:names.length,image:names.some(n=>n.includes('gemini-3.1-flash-image')),video:names.some(n=>n.includes('veo-3.1')),omni:names.some(n=>n.includes('gemini-omni'))};}
-module.exports={image,animate,expandVideo,testKey,ratio,outputPart};
+async function savePart(part,out,key,job){
+  job.signal?.throwIfAborted();
+  if(part?.data){await fs.writeFile(out,Buffer.from(part.data,'base64'));return;}
+  if(!part?.uri)throw new Error('Модель не вернула файл. Возможно, запрос отклонён фильтром или квотой.');
+  let url=new URL(part.uri);
+  for(let i=0;i<6;i++){
+    if(url.protocol!=='https:'||!['generativelanguage.googleapis.com','storage.googleapis.com'].includes(url.hostname)&&!url.hostname.endsWith('.googleusercontent.com'))throw new Error('Неожиданный адрес результата Google.');
+    const headers=url.hostname==='generativelanguage.googleapis.com'?{'x-goog-api-key':key}:{};
+    const signal=AbortSignal.any([...(job.signal?[job.signal]:[]),AbortSignal.timeout(180000)]);
+    const r=await providerRequest(async()=>{
+      const response=await fetch(url,{headers,signal,redirect:'manual'});
+      if(response.status>=400){await response.body?.cancel();throw Object.assign(new Error(`Google: не удалось скачать результат (${response.status}).`),{status:response.status,headers:response.headers});}
+      return response;
+    },{...job,signal,readOnly:true});
+    if(r.status>=300&&r.status<400){await r.body?.cancel();url=new URL(r.headers.get('location'),url);continue;}
+    const {pipeline}=require('node:stream/promises');
+    const {Readable}=require('node:stream');
+    const {createWriteStream}=require('node:fs');
+    await pipeline(Readable.fromWeb(r.body),createWriteStream(out),{signal});return;
+  }
+  throw new Error('Слишком много перенаправлений Google.');
+}
+async function image(key,file,out,options,job){
+  const {width,height}=dimensions(options.width,options.height);
+  const source=await sharp(file).rotate().resize(2048,2048,{fit:'inside',withoutEnlargement:true}).png().toBuffer();
+  const prompt=options.mode==='ai-enhance'?'Restore and enhance this image naturally. Preserve identity, layout, objects and text. Improve compression artifacts, textures and detail without inventing objects.':`Outpaint this image to a ${ratio(width,height)} desktop wallpaper. Preserve the original composition and every subject. Extend the scene beyond the original borders using matching perspective, lighting, texture and context. Never stretch or crop the subject, never use blurred, mirrored or repeated edge fill. Natural seamless continuation. ${options.prompt||''}`;
+  const ai=client(key);
+  const response=await providerRequest(()=>ai.interactions.create({model:'gemini-3.1-flash-image',input:[{type:'text',text:prompt},{type:'image',mime_type:'image/png',data:source.toString('base64')}],response_format:{type:'image',mime_type:'image/png',aspect_ratio:ratio(width,height),image_size:'4K'},store:false},interactionOptions(job.signal)),job);
+  const part=outputPart(response,'image');
+  if(!part?.data)throw new Error('Gemini не вернул изображение. Проверьте доступ к модели и квоту.');
+  job.signal?.throwIfAborted();
+  let result=sharp(Buffer.from(part.data,'base64')).resize(width,height,{fit:'cover'});
+  if(options.mode!=='ai-enhance'){
+    const meta=await sharp(source).metadata(),scale=Math.min(width/meta.width,height/meta.height);
+    const pw=Math.round(meta.width*scale),ph=Math.round(meta.height*scale);
+    const original=await sharp(file).rotate().resize(pw,ph).png().toBuffer();
+    result=result.composite([{input:original,left:Math.floor((width-pw)/2),top:Math.floor((height-ph)/2)}]);
+  }
+  await result.png().toFile(out);
+}
+async function animate(key,file,out,options,job){
+  const ai=client(key);
+  const bytes=await sharp(file).rotate().resize(2048,2048,{fit:'inside',withoutEnlargement:true}).png().toBuffer();
+  let op=await providerRequest(()=>ai.models.generateVideos({model:'veo-3.1-generate-preview',image:{imageBytes:bytes.toString('base64'),mimeType:'image/png'},prompt:`Animate this image as a calm living desktop wallpaper. Locked camera, subtle natural movement, preserve composition and identity, no cuts, no text, loop-friendly beginning and ending. ${options.prompt||''}`,config:{abortSignal:job.signal,aspectRatio:options.width>=options.height?'16:9':'9:16',resolution:'4k',durationSeconds:8,numberOfVideos:1}}),job);
+  job.stage('Veo генерирует 8 секунд в 4K…');
+  const until=Date.now()+20*60*1000;
+  while(!op.done){
+    if(Date.now()>until)throw new Error(`Google ещё обрабатывает видео. Операция: ${op.name}. Повторный запуск создаст новый платный запрос.`);
+    await delay(7000+Math.random()*3000,null,{signal:job.signal});
+    op=await providerRequest(()=>ai.operations.getVideosOperation({operation:op,config:{abortSignal:job.signal}}),{...job,readOnly:true});
+  }
+  if(op.error)throw new Error(op.error.message||'Ошибка генерации Veo');
+  const v=op.response?.generatedVideos?.[0]?.video;
+  await savePart(v?{data:v.videoBytes,uri:v.uri}:null,out,key,job);
+}
+async function expandVideo(key,file,out,options,job){
+  const ai=client(key);let uploaded;
+  try{
+    job.stage('Загрузка ролика в Google…');
+    uploaded=await providerRequest(()=>ai.files.upload({file,config:{mimeType:'video/mp4',abortSignal:job.signal}}),job);
+    for(let i=0;uploaded.state==='PROCESSING'&&i<90;i++){
+      await delay(2500+Math.random()*1000,null,{signal:job.signal});
+      uploaded=await providerRequest(()=>ai.files.get({name:uploaded.name,config:{abortSignal:job.signal}}),{...job,readOnly:true});
+    }
+    if(uploaded.state!=='ACTIVE')throw new Error('Google не смог подготовить видео.');
+    job.stage('ИИ дорисовывает движущиеся края…');
+    const res=await providerRequest(()=>ai.interactions.create({model:'gemini-omni-1.1-flash',input:[{type:'video',uri:uploaded.uri},{type:'text',text:`Expand the canvas to ${options.width>=options.height?'16:9':'9:16'}. Outpaint the missing borders with temporally coherent continuation of the original scene. Preserve the complete original video, its subjects, timing, lighting and motion. No cropping, no stretching, no cuts. Keep everything else the same. ${options.prompt||''}`}],response_format:{type:'video',aspect_ratio:options.width>=options.height?'16:9':'9:16',resolution:'1080p',delivery:'uri'},store:false,background:false},interactionOptions(job.signal)),job);
+    await savePart(outputPart(res,'video'),out,key,job);
+  }finally{
+    if(uploaded?.name)await ai.files.delete({name:uploaded.name,config:{httpOptions:{timeout:15000}}}).catch(()=>{});
+  }
+}
+async function testKey(key){
+  const ai=client(key),names=[];
+  const pager=await providerRequest(()=>ai.models.list({config:{pageSize:100}}),{readOnly:true});
+  for await(const m of pager)names.push(m.name);
+  return {count:names.length,image:names.some(n=>n.includes('gemini-3.1-flash-image')),video:names.some(n=>n.includes('veo-3.1')),omni:names.some(n=>n.includes('gemini-omni'))};
+}
+module.exports={image,animate,expandVideo,testKey,ratio,outputPart,interactionOptions};

@@ -1,46 +1,90 @@
 const {app,BrowserWindow,ipcMain,dialog,protocol,net,screen,safeStorage,Tray,Menu,shell,nativeImage}=require('electron');
 const fs=require('node:fs/promises'),fsSync=require('node:fs'),path=require('node:path'),{randomUUID}=require('node:crypto'),{pathToFileURL}=require('node:url');
 const {mediaType,publicAsset,dimensions,errorText}=require('./core.cjs');
+const {JobQueue,ExclusiveGate}=require('./job-queue.cjs');
 const media=require('./media.cjs'),ai=require('./ai.cjs'),{Wallpaper}=require('./wallpaper.cjs'),{importPinterest}=require('./pinterest.cjs');
 if(process.env.VELORA_DATA_DIR)app.setPath('userData',process.env.VELORA_DATA_DIR);
 protocol.registerSchemesAsPrivileged([{scheme:'velora',privileges:{standard:true,secure:true,supportFetchAPI:true,stream:true}}]);
 let win,tray,wallpaper,quitting=false,memoryKey='',job=null;
 const root=app.getPath('userData'),library=path.join(root,'library'),temp=path.join(root,'temp'),dbFile=path.join(root,'library.json'),settingsFile=path.join(root,'settings.json');
 let items=[],settings={pauseBattery:true,pauseFullscreen:true,launchAtLogin:true,restoreWallpaper:true,lastWallpaper:null};
+const queue=new JobQueue({onChange:broadcast}),gate=new ExclusiveGate();
 let writeQueue=Promise.resolve();
 function atomic(file,data){writeQueue=writeQueue.catch(()=>{}).then(async()=>{await fs.writeFile(file+'.tmp',JSON.stringify(data,null,2));await fs.rename(file+'.tmp',file);});return writeQueue;}
 async function read(file,fallback){try{return JSON.parse(await fs.readFile(file,'utf8'));}catch{return fallback;}}
 function key(){if(memoryKey)return memoryKey;try{return safeStorage.decryptString(fsSync.readFileSync(path.join(root,'gemini.key')));}catch{return '';}}
-function snapshot(){return {items:items.map(publicAsset),settings,job:job?{id:job.id,stage:job.stage,progress:job.progress,error:job.error,done:job.done,outputId:job.outputId}:null,keyConnected:!!key(),secureKeyStorage:safeStorage.isEncryptionAvailable()&&(process.platform!=='linux'||safeStorage.getSelectedStorageBackend()!=='basic_text'),displays:screen.getAllDisplays().map(d=>({id:String(d.id),name:d.label||`Экран ${d.id}`,width:Math.round(d.size.width*d.scaleFactor),height:Math.round(d.size.height*d.scaleFactor),primary:d.id===screen.getPrimaryDisplay().id})),active:wallpaper?.active,paused:wallpaper?.paused||false,autoPaused:wallpaper?.lastPause||false,capabilities:wallpaper?.capabilities(),version:app.getVersion()};}
+function publicJob(j){if(!j)return null;return {id:j.id,sourceId:j.sourceId,label:j.label,status:j.status,stage:j.stage,progress:j.progress,error:j.error?errorText(j.error):undefined,done:j.done,outputId:j.outputId};}
+function snapshot(){const current=queue.current()||job;return {jobs:queue.jobs.map(publicJob),queueCapacity:queue.capacity,items:items.map(publicAsset),settings,job:publicJob(current),keyConnected:!!key(),secureKeyStorage:safeStorage.isEncryptionAvailable()&&(process.platform!=='linux'||safeStorage.getSelectedStorageBackend()!=='basic_text'),displays:screen.getAllDisplays().map(d=>({id:String(d.id),name:d.label||`Экран ${d.id}`,width:Math.round(d.size.width*d.scaleFactor),height:Math.round(d.size.height*d.scaleFactor),primary:d.id===screen.getPrimaryDisplay().id})),active:wallpaper?.active,paused:wallpaper?.paused||false,autoPaused:wallpaper?.lastPause||false,capabilities:wallpaper?.capabilities(),version:app.getVersion()};}
 function broadcast(){if(win&&!win.isDestroyed())win.webContents.send('velora:state',snapshot());}
 function find(id){const x=items.find(x=>x.id===id);if(!x)throw new Error('Файл не найден в библиотеке.');return x;}
 async function add(source,name,extra={}){const type=mediaType(source),meta=await media.metadata(source);const stat=await fs.stat(source);if(!stat.isFile())throw new Error('Выберите файл.');if(meta.width*meta.height>100000000)throw new Error('Изображение превышает 100 Мп.');const id=randomUUID(),dest=path.join(library,id+path.extname(source).toLowerCase()),thumb=path.join(library,id+'.thumb.jpg');try{if(type==='image')await require('sharp')(source).rotate().png().toFile(dest+'.png');else await fs.copyFile(source,dest);const actual=type==='image'?dest+'.png':dest;await media.thumbnail(actual,thumb,type);const item={id,name:name||path.basename(source,path.extname(source)),path:actual,thumb,type,...meta,bytes:(await fs.stat(actual)).size,createdAt:Date.now(),favorite:false,...extra};items.unshift(item);await atomic(dbFile,items);broadcast();return publicAsset(item);}catch(e){await fs.rm(dest,{force:true});await fs.rm(dest+'.png',{force:true});await fs.rm(thumb,{force:true});throw e;}}
 async function saveKey(value){if(typeof value!=='string'||value.length>300)throw new Error('Неверный API-ключ.');const next=value.trim();if(next&&!/^AIza[\w-]{20,}$/.test(next))throw new Error('Введите ключ Gemini из Google AI Studio.');memoryKey=next;if(!memoryKey){await fs.rm(path.join(root,'gemini.key'),{force:true});broadcast();return;}if(!/^AIza[\w-]{20,}$/.test(memoryKey))throw new Error('Введите ключ Gemini из Google AI Studio.');if(snapshot().secureKeyStorage)await fs.writeFile(path.join(root,'gemini.key'),safeStorage.encryptString(memoryKey),{mode:0o600});broadcast();return {persistent:snapshot().secureKeyStorage};}
-async function begin(id,options){if(job&&!job.done)throw new Error('Дождитесь текущей обработки или отмените её.');const item=find(id);dimensions(options.width,options.height);const modes=['enhance','expand','animate','ai-enhance','video-expand','video-background'];if(!modes.includes(options.mode))throw new Error('Неизвестная операция.');if(options.mode==='animate'&&item.type!=='image')throw new Error('Для анимации выберите фотографию.');if(['video-expand','video-background'].includes(options.mode)&&item.type!=='video')throw new Error('Выберите видео.');if(['expand','ai-enhance'].includes(options.mode)&&item.type!=='image')throw new Error('Выберите изображение.');if(options.mode==='video-expand'&&item.duration>10)throw new Error('Google принимает для AI-расширения ролики до 10 секунд. Для длинного видео доступен «AI-фон» или кадрирование.');if(options.mode!=='enhance'&&!key())throw new Error('Подключите Gemini в настройках.');const controller=new AbortController();job={id:randomUUID(),sourceId:id,stage:'Подготовка…',progress:0,done:false,controller};const current=job;const jobdir=path.join(temp,current.id);await fs.mkdir(jobdir,{recursive:true});const output=path.join(jobdir,item.type==='video'||options.mode==='animate'?'result.mp4':'result.png');const ctx={signal:controller.signal,duration:item.duration,progress:n=>{current.progress=Math.round(n);broadcast();},stage:s=>{current.stage=s;current.progress=null;broadcast();}};
-  void (async()=>{try{if(options.mode==='enhance'){ctx.stage('Улучшение и масштабирование…');await media.transcode(item.path,output,options,ctx);}else if(['expand','ai-enhance'].includes(options.mode)){ctx.stage('Gemini обрабатывает изображение…');await ai.image(key(),item.path,output,options,ctx);}else if(options.mode==='video-background'){const frame=path.join(jobdir,'frame.png'),bg=path.join(jobdir,'background.png');await media.aiFrame(item.path,frame);ctx.stage('Gemini дорисовывает неподвижный фон…');await ai.image(key(),frame,bg,options,ctx);ctx.stage('Сохранение видео с AI-фоном…');await media.videoBackground(item.path,bg,output,options,ctx);}else{const raw=path.join(jobdir,'generated.mp4');if(options.mode==='animate')await ai.animate(key(),item.path,raw,options,ctx);else{const normalized=path.join(jobdir,'input.mp4');await media.transcode(item.path,normalized,{width:item.width,height:item.height,fit:'contain'},ctx);await ai.expandVideo(key(),normalized,raw,options,ctx);}ctx.stage('Подготовка результата 4K…');await media.transcode(raw,output,options,ctx);}controller.signal.throwIfAborted();const result=await add(output,`${item.name} · ${options.mode==='animate'?'Motion':options.mode.includes('expand')?'AI':options.ultra?'Ultra':'4K'}`,{derivedFrom:id,processing:options.mode,ultra:!!options.ultra});current.outputId=result.id;current.stage='Готово';current.progress=100;}catch(e){current.error=controller.signal.aborted?'Обработка отменена. Облачный запрос мог уже тарифицироваться Google.':errorText(e);current.stage='Обработка остановлена';}finally{current.done=true;await fs.rm(jobdir,{recursive:true,force:true}).catch(()=>{});broadcast();}})();broadcast();return {id:current.id};}
+async function begin(id,input){
+ const item=find(id),d=dimensions(input?.width,input?.height);
+ const options={mode:input?.mode,...d,fit:input?.fit||'contain',ultra:!!input?.ultra,prompt:String(input?.prompt||'').trim().slice(0,2000)};
+ const modes=['enhance','expand','animate','ai-enhance','video-expand','video-background'];
+ if(!modes.includes(options.mode)||!['cover','contain','stretch'].includes(options.fit))throw new Error('Неизвестная операция или режим заполнения.');
+ if(options.mode==='animate'&&item.type!=='image')throw new Error('Для анимации выберите фотографию.');
+ if(['video-expand','video-background'].includes(options.mode)&&item.type!=='video')throw new Error('Выберите видео.');
+ if(['expand','ai-enhance'].includes(options.mode)&&item.type!=='image')throw new Error('Выберите изображение.');
+ if(options.mode==='video-expand'&&item.duration>10)throw new Error('Google принимает для AI-расширения ролики до 10 секунд. Для длинного видео доступен «AI-фон» или кадрирование.');
+ const apiKey=options.mode==='enhance'?'':key();
+ if(options.mode!=='enhance'&&!apiKey)throw new Error('Подключите Gemini в настройках.');
+ return queue.enqueue({key:JSON.stringify([id,options]),sourceId:id,label:item.name,run:async current=>{
+  const controller=current.controller,jobdir=path.join(temp,current.id);
+  const output=path.join(jobdir,item.type==='video'||options.mode==='animate'?'result.mp4':'result.png');
+  const ctx={signal:controller.signal,duration:item.duration,progress:n=>{current.progress=Math.round(n);broadcast();},stage:s=>{current.stage=s;current.progress=null;broadcast();}};
+  try{
+   await fs.mkdir(jobdir,{recursive:true});
+   if(options.mode==='enhance'){
+    ctx.stage('Улучшение и масштабирование…');await media.transcode(item.path,output,options,ctx);
+   }else if(['expand','ai-enhance'].includes(options.mode)){
+    ctx.stage('Gemini обрабатывает изображение…');await ai.image(apiKey,item.path,output,options,ctx);
+   }else if(options.mode==='video-background'){
+    const frame=path.join(jobdir,'frame.png'),bg=path.join(jobdir,'background.png');
+    await media.aiFrame(item.path,frame,ctx);ctx.signal.throwIfAborted();
+    ctx.stage('Gemini дорисовывает неподвижный фон…');await ai.image(apiKey,frame,bg,options,ctx);
+    ctx.stage('Сохранение видео с AI-фоном…');await media.videoBackground(item.path,bg,output,options,ctx);
+   }else{
+    const raw=path.join(jobdir,'generated.mp4');
+    if(options.mode==='animate')await ai.animate(apiKey,item.path,raw,options,ctx);
+    else{
+     const normalized=path.join(jobdir,'input.mp4');
+     await media.transcode(item.path,normalized,{width:item.width,height:item.height,fit:'contain'},ctx);
+     await ai.expandVideo(apiKey,normalized,raw,options,ctx);
+    }
+    ctx.stage('Подготовка результата 4K…');await media.transcode(raw,output,options,ctx);
+   }
+   controller.signal.throwIfAborted();
+   const suffix=options.mode==='animate'?'Motion':options.mode.includes('expand')?'AI':options.ultra?'Ultra':'4K';
+   const result=await add(output,item.name+' · '+suffix,{derivedFrom:id,processing:options.mode,ultra:!!options.ultra});
+   return result.id;
+  }finally{await fs.rm(jobdir,{recursive:true,force:true}).catch(()=>{});}
+ }});
+}
 const handlers={
  state:()=>snapshot(),
  pick:async()=>{const r=await dialog.showOpenDialog(win,{title:'Добавить обои',properties:['openFile','multiSelections'],filters:[{name:'Фото и видео',extensions:['png','jpg','jpeg','webp','avif','bmp','tiff','mp4','webm','mov','mkv','m4v','avi','gif']}]});const results=[];for(const file of r.filePaths)results.push(await add(file));return results;},
  import:async(paths)=>{if(!Array.isArray(paths)||paths.length>30||paths.some(p=>typeof p!=='string'))throw new Error('Можно загрузить до 30 файлов за раз.');const out=[];for(const p of paths)out.push(await add(p));return out;},
  pinterest:async url=>{const c=new AbortController();const timer=setTimeout(()=>c.abort(),120000);let p;try{p=await importPinterest(url,path.join(temp,randomUUID()),c.signal);return await add(p,'Из Pinterest');}finally{clearTimeout(timer);if(p)await fs.rm(p,{force:true});}},
  favorite:async id=>{find(id).favorite=!find(id).favorite;await atomic(dbFile,items);broadcast();},
- remove:async id=>{const item=find(id);if(job&&!job.done&&job.sourceId===id)throw new Error('Сначала завершите обработку этого файла.');if(wallpaper.active?.id===id)throw new Error('Сначала остановите или замените эти обои.');items=items.filter(x=>x.id!==id);await atomic(dbFile,items);await fs.rm(item.path,{force:true});await fs.rm(item.thumb,{force:true});broadcast();},
+ remove:async id=>{const item=find(id);if(queue.hasSource(id))throw new Error('Сначала завершите обработку этого файла.');if(wallpaper.active?.id===id)throw new Error('Сначала остановите или замените эти обои.');items=items.filter(x=>x.id!==id);await atomic(dbFile,items);await fs.rm(item.path,{force:true});await fs.rm(item.thumb,{force:true});broadcast();},
  apply:async(id,displayId,fit)=>{if(!['contain','cover','stretch'].includes(fit))throw new Error('Неверный режим заполнения.');const result=await wallpaper.apply(find(id),displayId,fit);settings.lastWallpaper={id,displayId,fit};await atomic(settingsFile,settings);broadcast();return result;},
  stop:async()=>{wallpaper.stop();settings.lastWallpaper=null;await atomic(settingsFile,settings);broadcast();},
  pause:()=>{wallpaper.paused=!wallpaper.paused;wallpaper.refresh();broadcast();},
  settings:async patch=>{for(const k of ['pauseBattery','pauseFullscreen','launchAtLogin','restoreWallpaper'])if(typeof patch[k]==='boolean')settings[k]=patch[k];if(app.isPackaged&&!process.env.VELORA_DATA_DIR&&process.platform==='win32')app.setLoginItemSettings({openAtLogin:settings.launchAtLogin,args:['--hidden']});else if(app.isPackaged&&!process.env.VELORA_DATA_DIR&&'launchAtLogin'in patch){const dir=path.join(app.getPath('home'),'.config','autostart');await fs.mkdir(dir,{recursive:true});const file=path.join(dir,'velora.desktop');if(settings.launchAtLogin)await fs.writeFile(file,`[Desktop Entry]\nType=Application\nName=Velora\nExec="${(process.env.APPIMAGE||process.execPath).replace(/["`$\\]/g,'\\$&')}" --hidden\nTerminal=false\n`);else await fs.rm(file,{force:true});}wallpaper.settings=settings;await atomic(settingsFile,settings);broadcast();},
- key:saveKey,testKey:async()=>ai.testKey(key()),process:begin,cancel:()=>{job?.controller.abort();},
+ key:saveKey,testKey:async()=>ai.testKey(key()),process:begin,cancel:id=>queue.cancel(id),
  export:async id=>{const item=find(id),r=await dialog.showSaveDialog(win,{defaultPath:`${item.name.replace(/[<>:"/\\|?*]/g,'-')}${path.extname(item.path)}`});if(!r.canceled&&r.filePath){if(path.resolve(r.filePath)===path.resolve(item.path))return;await fs.copyFile(item.path,r.filePath);return r.filePath;}},
  openExternal:async url=>{if(!['https://aistudio.google.com/apikey','https://ai.google.dev/gemini-api/docs/pricing','https://ai.google.dev/gemini-api/docs/available-regions'].includes(url))throw new Error('Ссылка недоступна.');await shell.openExternal(url);}
 };
 async function createWindow(){win=new BrowserWindow({width:1440,height:940,minWidth:1024,minHeight:720,title:'Velora',backgroundColor:'#f8f7fc',icon:path.join(__dirname,'../assets/icon.png'),show:!process.argv.includes('--hidden'),autoHideMenuBar:true,webPreferences:{preload:path.join(__dirname,'preload.cjs'),contextIsolation:true,sandbox:true,nodeIntegration:false}});win.webContents.setWindowOpenHandler(()=>({action:'deny'}));win.webContents.on('will-navigate',e=>e.preventDefault());win.webContents.session.setPermissionRequestHandler((wc,p,cb)=>cb(false));win.on('close',e=>{if(!quitting&&tray&&wallpaper.active?.type==='video'){e.preventDefault();win.hide();}});win.on('closed',()=>{win=null;});await win.loadFile(path.join(__dirname,'../dist/index.html'));}
-app.on('before-quit',()=>{quitting=true;job?.controller.abort();wallpaper?.stop();});
+app.on('before-quit',()=>{quitting=true;queue.shutdown();wallpaper?.stop();});
 app.on('window-all-closed',()=>{if(!wallpaper?.active&&!tray)app.quit();});
 if(!app.requestSingleInstanceLock())app.quit();else{
 app.on('second-instance',async()=>{if(!win)await createWindow();win.show();win.focus();});
 app.whenReady().then(async()=>{await fs.mkdir(library,{recursive:true});await fs.mkdir(temp,{recursive:true});items=await read(dbFile,[]);settings={...settings,...await read(settingsFile,{})};wallpaper=new Wallpaper(broadcast);wallpaper.settings=settings;
  protocol.handle('velora',request=>{const u=new URL(request.url);const item=items.find(x=>x.id===u.pathname.slice(1));if(!item||!['media','thumb'].includes(u.hostname))return new Response('Not found',{status:404});return net.fetch(pathToFileURL(u.hostname==='thumb'?item.thumb:item.path).href,{headers:request.headers});});
- for(const [name,handler]of Object.entries(handlers))ipcMain.handle(`velora:${name}`,async(event,...args)=>{if(!win||event.sender!==win.webContents||event.senderFrame!==win.webContents.mainFrame)return {ok:false,error:'Недопустимый источник запроса.'};try{return {ok:true,value:await handler(...args)};}catch(e){return {ok:false,error:errorText(e)};}});
+ for(const [name,handler]of Object.entries(handlers))ipcMain.handle(`velora:${name}`,async(event,...args)=>{if(!win||event.sender!==win.webContents||event.senderFrame!==win.webContents.mainFrame)return {ok:false,error:'Недопустимый источник запроса.'};try{return {ok:true,value:await (['pick','import','pinterest','apply','stop','testKey'].includes(name)?gate.run(['pick','import','pinterest'].includes(name)?'imports':['apply','stop'].includes(name)?'desktop':'key-test',()=>handler(...args)):handler(...args))};}catch(e){return {ok:false,error:errorText(e)};}});
  const firstRun=!fsSync.existsSync(path.join(root,'seeded'));if(!items.length&&firstRun){for(const [file,name]of [['lavender.png','Лавандовый горизонт'],['dusk.png','Сумерки в горах'],['ocean.png','Тихий океан'],['bloom.png','Мягкий свет'],['flow.mp4','Лавандовое течение']])await add(path.join(__dirname,'../assets',file).replace('app.asar'+path.sep,'app.asar.unpacked'+path.sep),name,{sample:true});await fs.writeFile(path.join(root,'seeded'),'1');}
  if(process.env.VELORA_KEY_FILE&&!app.isPackaged){const imported=await read(process.env.VELORA_KEY_FILE,{});if(imported.key)await saveKey(imported.key);}
  await handlers.settings({launchAtLogin:settings.launchAtLogin});
