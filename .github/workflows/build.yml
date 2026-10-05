@@ -38,6 +38,12 @@ jobs:
       - name: Linux packages
         if: runner.os == 'Linux'
         run: pnpm exec electron-builder --linux AppImage deb --x64 --publish never
+      - name: Packaged Linux startup and restoration
+        if: runner.os == 'Linux'
+        run: xvfb-run -a node scripts/packaged-qa.cjs
+        env:
+          XDG_SESSION_TYPE: x11
+          VELORA_EXE: ${{ github.workspace }}/release/linux-unpacked/velora
       - uses: actions/upload-artifact@v4
         with:
           name: velora-${{ runner.os }}-x64
@@ -50,4 +56,5 @@ jobs:
         if: always() && runner.os == 'Linux'
         with:
           name: linux-qa
-          path: ../qa/*.json
+          path: .qa/*.json
+          include-hidden-files: true

@@ -50,7 +50,8 @@
       "node_modules/ffmpeg-static/**",
       "node_modules/ffprobe-static/**",
       "node_modules/koffi/**",
-      "node_modules/@img/**"
+      "node_modules/@img/**",
+      "assets/**"
     ],
     "win": {
       "icon": "assets/icon.png",

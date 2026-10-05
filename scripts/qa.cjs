@@ -2,7 +2,7 @@ const {_electron:electron}=require('playwright');
 const path=require('node:path'),fs=require('node:fs/promises'),{setTimeout:delay}=require('node:timers/promises');
 const {run,ffmpeg}=require('../desktop/media.cjs');
 (async()=>{
- const qa=path.resolve('../qa');await fs.mkdir(qa,{recursive:true});
+ const qa=path.resolve('.qa');await fs.mkdir(qa,{recursive:true});
  const env={...process.env,VELORA_DATA_DIR:path.join(qa,'profile-'+Date.now())};delete env.ELECTRON_RUN_AS_NODE;
  const app=await electron.launch({args:['.','--disable-gpu'],env,timeout:60000});
  try{
